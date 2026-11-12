@@ -132,6 +132,10 @@ FEATURE_KEYS = [
     # 板块
     "sector_name", "sector_chg_today", "sector_ret5", "sector_above_ma20",
     "sector_rank_today", "sector_pe_pct",
+    # 板块 3 天验证（§10.1.1）
+    "sector_cum3", "sector_rank_3ago", "sector_limit_up", "sector_top10_days",
+    "sector_breadth", "sector_amount_rank", "sector_amount_n",
+    "sector_n_members", "sector_thin",
     # 大盘
     "index_above_ma20", "index_ma20_slope", "index_chg_today",
     # 元信息
@@ -266,6 +270,15 @@ def build_features(bars: dict, *, val: Optional[dict] = None,
         f["sector_above_ma20"] = sector_ctx.get("above_ma20")
         f["sector_rank_today"] = sector_ctx.get("rank_today")
         f["sector_pe_pct"] = sector_ctx.get("pe_pct")
+        # §10.1.1 板块 3 天验证
+        f["sector_cum3"] = sector_ctx.get("cum3")
+        f["sector_rank_3ago"] = sector_ctx.get("rank_3ago")
+        f["sector_limit_up"] = sector_ctx.get("limit_up")
+        f["sector_top10_days"] = sector_ctx.get("top10_days")
+        f["sector_breadth"] = sector_ctx.get("breadth_ratio")
+        # 行业样本数（池内该行业只有 1~2 只时无法算板块热度，A 短线不适用）
+        f["sector_n_members"] = sector_ctx.get("n_members")
+        f["sector_thin"] = sector_ctx.get("thin")
 
     # ---- 大盘
     if market_ctx:
@@ -324,21 +337,102 @@ def equal_weight_index(members: list[dict]) -> Optional[dict]:
 
 def make_sector_ctx(sector_key: str, name: str, index_bars: dict,
                     rank_today: Optional[int] = None,
-                    pe_pct: Optional[float] = None) -> dict:
-    """板块上下文：当日涨幅、近5日涨幅、是否站上MA20。"""
+                    pe_pct: Optional[float] = None,
+                    extras: Optional[dict] = None) -> dict:
+    """板块上下文：当日涨幅、近5日涨幅、是否站上MA20 + §10.1.1 三天验证指标。"""
     c = index_bars["close"]
     n = len(c)
     chg = _pct(c[-1], c[-2]) if n >= 2 else None
     ret5 = _pct(c[-1], c[-6]) if n >= 6 else None
     ma20 = _ma(c, 20)
-    return {
+    ctx = {
         "name": name,
         "chg_today": chg,
         "ret5": ret5,
         "above_ma20": int(c[-1] > ma20) if ma20 else None,
         "rank_today": rank_today,
         "pe_pct": pe_pct,
+        "cum3": _pct(c[-1], c[-4]) if n >= 4 else None,
     }
+    if extras:
+        ctx.update(extras)
+    return ctx
+
+
+def sector_breadth(member_bars: list[dict], date_str: Optional[str] = None) -> dict:
+    """§10.1.1 板块广度：当日涨家数/跌家数/涨停家数（同花顺口径：≥9.8% 视为涨停）。"""
+    up = down = flat = limit_up = 0
+    for b in member_bars:
+        dates = b.get("date")
+        if dates is None:
+            continue
+        ds = [str(d) for d in dates]
+        if len(ds) < 2:
+            continue
+        pos = None
+        if date_str is not None:
+            try:
+                pos = ds.index(str(date_str))
+            except ValueError:
+                pos = None
+            if pos is None:
+                continue
+        else:
+            pos = len(ds) - 1
+        if pos < 1:
+            continue
+        c0, c1 = b["close"][pos - 1], b["close"][pos]
+        if not c0 or not c1:
+            continue
+        try:
+            pct = (float(c1) / float(c0) - 1.0) * 100.0
+        except (ZeroDivisionError, TypeError, ValueError):
+            continue
+        if abs(pct) < 1e-9:
+            flat += 1
+        elif pct > 0:
+            up += 1
+        else:
+            down += 1
+        if pct >= 9.8:
+            limit_up += 1
+    if down > 0:
+        ratio = up / down
+    else:
+        ratio = float("inf") if up > 0 else None
+    return {"up": up, "down": down, "flat": flat, "limit_up": limit_up,
+            "breadth_ratio": ratio}
+
+
+def sector_rank_series(sector_index: dict) -> dict:
+    """给单个板块的指数，返回 {date: 当日涨幅%}，用于跨板块排名。"""
+    c = sector_index["close"]
+    out = {}
+    for i, d in enumerate(sector_index["date"]):
+        if i >= 1 and c[i - 1]:
+            out[str(d)] = (float(c[i]) / float(c[i - 1]) - 1.0) * 100.0
+    return out
+
+
+def rank_history_stats(sector_chg_by_date: dict, sector_key: str, dates: list[str],
+                       rank_map: dict, top10_days_min: int) -> dict:
+    """从每日板块涨幅排名表里取：今天排名、3个交易日前排名、过去3日进前10的天数。
+
+    rank_map: {date: {sector_key: rank}}；dates: 升序的最近 4 个交易日。
+    """
+    if not dates:
+        return {}
+    today = dates[-1]
+    rank_today = (rank_map.get(today) or {}).get(sector_key)
+    look = 3
+    rank_3ago = (rank_map.get(dates[-1 - look]) or {}).get(sector_key) if len(dates) > look else None
+    window = dates[-(3):]
+    top10 = 0
+    for d in window:
+        r = (rank_map.get(d) or {}).get(sector_key)
+        if r is not None and r <= 10:
+            top10 += 1
+    return {"rank_today": rank_today, "rank_3ago": rank_3ago, "top10_days": top10}
 
 
 def make_market_ctx(index_bars: dict) -> dict:
@@ -370,6 +464,12 @@ def load_pool() -> Optional[dict]:
 
 def load_snapshot() -> Optional[dict]:
     return _load_json(C.SNAP)
+
+
+def load_industry() -> dict:
+    """行业映射 {code: {industry2, industry1, ...}}（东财 F10 EM2016，tools/build_industry.py 生成）。"""
+    doc = _load_json(os.path.join(C.DATA, "industry.json")) or {}
+    return doc.get("stocks") or {}
 
 
 # ============================================================ 历史切片（回测/事件研究用）

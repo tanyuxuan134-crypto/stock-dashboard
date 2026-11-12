@@ -299,7 +299,8 @@ function emptyBox(mode){
       txt = '<b>今天 0 只。</b> 没有个股同时满足「站上MA20且MA20上翘(B1) + 四信号里至少 2 个」。宁可空仓，不勉强。';
     }
   } else if (mode === 'A'){
-    txt = '<b>今天 0 只。</b> 需要「板块当日涨幅前5且板块指数>1%」+ 个股量能放大 + 收盘站上MA5，今天没有同时满足的。';
+    txt = '<b>今天 0 只。</b> 需要「板块当日涨幅前5且板块指数>1%」+ 板块 3 天验证（§10.1.1）+ 个股量能放大 + 收盘站上MA5，今天没有同时满足的。' +
+          (D.a_thin ? '<br>另有 <b>' + D.a_thin + '</b> 只所属行业在池内不足 3 只（算不出板块排名/广度），A 短线按规则不适用。' : '');
   } else {
     txt = '<b>今天 0 只。</b> 需要 PE 近5年分位<30% +（股息率>4% 或 ROE>10%且PB<1.5）+ 连续5年盈利 + 距1年高点<−20%。';
   }
@@ -945,6 +946,7 @@ def _payload(ctx: dict, out_dir: str | None = None) -> dict:
                     "C": ctx.get("signals_C") or []},
         "snapshot_B": ctx.get("snapshot_B") or [],
         "rows": rows,
+        "a_thin": sum(1 for r in rows if "样本不足" in (r.get("A_fail") or "")),
         "holdings": {"rows": hold_rows,
                      "cash_release": holdings.get("cash_release") or 0,
                      "same_chain_warning": holdings.get("same_chain_warning") or ""},

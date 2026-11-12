@@ -89,26 +89,38 @@ def load_snapshot_map() -> dict:
 
 
 def build_sector_context(pool: dict, snap_map: dict, stocks_bars: dict) -> tuple[dict, list]:
-    """按「行业」等权指数算板块当日涨幅与排名（§10.1 板块排名 / §10.3 板块共振）。"""
+    """按「行业」等权指数算板块当日涨幅与排名（§10.1 板块排名 / §10.3 板块共振）。
+
+    行业优先用东财 F10 的 EM2016 二级行业（data/industry.json，43 个行业），
+    缺失时依次回退到新浪行业、池子大类——只有真实行业板块才能算
+    §10.1.1「板块内成交额前 3 / 涨停家数 / 涨跌家数」。
+    """
+    ind_map = F.load_industry()
     groups: dict[str, list[dict]] = {}
     for s in pool.get("stocks") or []:
-        row = snap_map.get(str(s["code"])) or {}
-        ind = row.get("industry") or s.get("industry") or SECTOR_CN.get(s.get("sector"), "其他")
+        code = str(s["code"])
+        row = snap_map.get(code) or {}
+        ind = ((ind_map.get(code) or {}).get("industry2")
+               or row.get("industry") or s.get("industry")
+               or SECTOR_CN.get(s.get("sector"), "其他"))
         s["industry_name"] = ind
         groups.setdefault(ind, []).append(s)
 
     stats = []
     for ind, members in groups.items():
-        bars_list = [stocks_bars[m["code"]] for m in members
-                     if m["code"] in stocks_bars and stocks_bars[m["code"]]]
-        if not bars_list:
+        member_bars = [stocks_bars[m["code"]] for m in members
+                       if m["code"] in stocks_bars and stocks_bars[m["code"]]]
+        if not member_bars:
             continue
-        idx = F.equal_weight_index(bars_list)
+        idx = F.equal_weight_index(member_bars)
         if not idx:
             continue
         ctx = F.make_sector_ctx(ind, ind, idx)
+        ctx["n_members"] = len(member_bars)
+        # 池内该行业只有 1~2 只 → 无法算板块热度（§10.1.1 需要全行业广度）
+        ctx["thin"] = len(member_bars) < 3
         stats.append({"group": ind, "members": members, "ctx": ctx, "index": idx,
-                      "n_members": len(bars_list)})
+                      "n_members": len(member_bars), "bars": member_bars})
     # 按当日涨幅排名（只统计成员≥3 的组，避免单票噪音）
     valid = [s for s in stats if s["n_members"] >= 3]
     valid.sort(key=lambda s: -(s["ctx"].get("chg_today") or -99))
@@ -116,6 +128,27 @@ def build_sector_context(pool: dict, snap_map: dict, stocks_bars: dict) -> tuple
         s["ctx"]["rank_today"] = i
     for s in stats:
         s["ctx"].setdefault("rank_today", None)
+
+    # ---- §10.1.1 板块 3 天验证：3日累计涨幅、排名变化、涨停家数、上榜天数、广度
+    if valid:
+        all_dates = sorted({str(d) for s in valid for d in s["index"]["date"]})
+        recent = all_dates[-(C.A_SECTOR["rank_lookback"] + 2):] if len(all_dates) else []
+        chg_by_sector = {s["group"]: F.sector_rank_series(s["index"]) for s in valid}
+        rank_map: dict[str, dict[str, int]] = {}
+        for d in recent:
+            vals = []
+            for s in valid:
+                chg = chg_by_sector[s["group"]].get(d)
+                if chg is not None:
+                    vals.append((chg, s["group"]))
+            vals.sort(key=lambda x: -x[0])
+            rank_map[d] = {g: k + 1 for k, (_, g) in enumerate(vals)}
+        last_date = str(valid[0]["index"]["date"][-1])
+        for s in valid:
+            extras = F.rank_history_stats(chg_by_sector[s["group"]], s["group"],
+                                          recent, rank_map, C.A_SECTOR["top10_days_min"])
+            extras.update(F.sector_breadth(s["bars"], last_date))
+            s["ctx"].update(extras)
     sector_ctx_by_stock = {}
     for s in stats:
         for m in s["members"]:
@@ -213,6 +246,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
 
     feats, all_rows = [], []
     sig_A, sig_B, sig_C, snap_B = [], [], [], []
+    # 第一遍：算特征（先不判定，因为 §10.1.1 的「板块内成交额排名」要等全池算完才能排）
     for s in stocks:
         code, name, sector = s["code"], s.get("name") or "", s.get("sector") or "other"
         sctx = sector_ctx_by_stock.get(code)
@@ -220,13 +254,30 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
                        sector_ctx=sctx, market_ctx=market_ctx)
         if not f:
             continue
+        f["_sector_cn"] = SECTOR_CN.get(sector, sector)
         feats.append(f)
+
+    # §10.1.1：通过板块验证后，只买「板块内成交额排名前3」；4~8 是跟风股，不买
+    by_ind: dict[str, list[dict]] = {}
+    for f in feats:
+        by_ind.setdefault(f.get("sector_name") or "—", []).append(f)
+    for arr in by_ind.values():
+        arr.sort(key=lambda x: -(x.get("amount") or 0))
+        for i, f in enumerate(arr, 1):
+            f["sector_amount_rank"] = i
+            f["sector_amount_n"] = len(arr)
+
+    # 第二遍：三套模式判定 + 生成交易计划
+    for f in feats:
+        code = f.get("code") or ""
+        name = f.get("name") or ""
+        sector = f.get("sector") or "other"
         rA = RL.eval_mode_A(f)
         rB = RL.eval_mode_B(f)
         rC = RL.eval_mode_C(f)
         rBS = RL.eval_mode_B_snapshot(f)
         row = {
-            "code": code, "name": name, "sector": SECTOR_CN.get(sector, sector),
+            "code": code, "name": name, "sector": f.get("_sector_cn") or sector,
             "industry": f.get("sector_name"),
             "close": f.get("close"), "chg_pct": f.get("chg_pct"),
             "pe_ttm": f.get("pe_ttm"), "pe_pct_5y": f.get("pe_pct_5y"),
@@ -251,7 +302,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
             sig_A.append({"code": code, "name": name, "sector": f.get("sector_name"),
                           "close": f.get("close"), "chg_pct": f.get("chg_pct"),
                           "score_text": f"{rA['n_ok']}/{rA['n_req']}",
-                          "why": _why(rA, ["A1", "A2", "A3", "A4", "A5"]),
+                          "why": _why(rA, ["A1", "A2", "S", "A12", "A3", "A4", "A5"]),
                           "trade_plan": _trade_plan(f, rA, PF.load_account(), "A"),
                           "stop_text": "−3% 硬止损",
                           "take_text": "+6~8% 全部卖出",
@@ -356,7 +407,15 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
         "sector_stats": [{"group": s["group"], "n": s["n_members"],
                           "chg": s["ctx"].get("chg_today"), "ret5": s["ctx"].get("ret5"),
                           "above_ma20": s["ctx"].get("above_ma20"),
-                          "rank": s["ctx"].get("rank_today")} for s in sector_stats],
+                          "rank": s["ctx"].get("rank_today"),
+                          # §10.1.1 板块 3 天验证
+                          "cum3": s["ctx"].get("cum3"),
+                          "rank_3ago": s["ctx"].get("rank_3ago"),
+                          "limit_up": s["ctx"].get("limit_up"),
+                          "top10_days": s["ctx"].get("top10_days"),
+                          "breadth": s["ctx"].get("breadth_ratio"),
+                          "up": s["ctx"].get("up"), "down": s["ctx"].get("down")}
+                         for s in sector_stats],
         "market": market_ctx,
         "snapshot_B": snap_B,
         "profile": port["profile"],

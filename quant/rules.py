@@ -133,13 +133,80 @@ def eval_mode_A(f: dict, cfg=C) -> dict:
     name = (f.get("name") or "")
     py = _num(f.get("profit_years"))
 
+    # §10.1.1 板块 3 天验证（2026-11-12 用户补充）
+    S = cfg.A_SECTOR
+    cum3 = _num(f.get("sector_cum3"))
+    rank3ago = _num(f.get("sector_rank_3ago"))
+    limit_up = _num(f.get("sector_limit_up"))
+    top10_days = _num(f.get("sector_top10_days"))
+    breadth = _num(f.get("sector_breadth"))
+    amt_rank = _num(f.get("sector_amount_rank"))
+    amt_n = _num(f.get("sector_amount_n"))
+
+    # S1：3日累计涨幅必须落在「刚启动」甜区 +3%~+10%；+10~+15 只准轻仓；>+15 追高区禁止
+    if cum3 is None:
+        s1_ok, s1_note = None, "板块3日累计涨幅数据缺失"
+    elif cum3 < S["cum3_min"]:
+        s1_ok, s1_note = False, "没启动（3日累计 <+3%）"
+    elif cum3 <= S["cum3_max"]:
+        s1_ok, s1_note = True, "刚启动甜区（+3%~+10%）"
+    elif cum3 <= S["cum3_heavy_max"]:
+        s1_ok, s1_note = True, "已走一半（+10%~+15%）：只能轻仓，止损收紧到 -2%"
+    else:
+        s1_ok, s1_note = False, "追高区（>+15%，这是接盘位，禁止）"
+    light_zone = bool(cum3 is not None and S["cum3_max"] < cum3 <= S["cum3_heavy_max"])
+
+    # S2：今天排名上升、或稳定在前 5
+    if sector_rank is None:
+        s2_ok = None
+    else:
+        s2_ok = sector_rank <= S["rank_top_n"] and (rank3ago is None or sector_rank <= rank3ago)
+
+    # S5：板块内涨跌比 ≥2 真普涨；1~2 结构行情只做龙头；<1 假涨不做
+    if breadth is None:
+        s5_ok, s5_note = None, "板块广度数据缺失"
+    elif breadth >= S["breadth_min"]:
+        s5_ok, s5_note = True, "真普涨（涨跌比≥2）"
+    elif breadth >= S["breadth_leader_min"]:
+        s5_ok = bool(amt_rank is not None and amt_rank <= S["buy_amount_rank_max"])
+        s5_note = "结构行情（涨跌比1~2）：只做板块龙头"
+    else:
+        s5_ok, s5_note = False, "假涨（涨跌比<1，多半是权重拉的）"
+
+    # 行业样本不足（池内该行业 <3 只）：板块排名/热度不可计算，A 短线不适用
+    thin = bool(f.get("sector_thin"))
+    n_mem = _num(f.get("sector_n_members"))
+    thin_note = (f"该行业池内仅 {int(n_mem)} 只，算不了板块热度，A 短线不适用"
+                 if thin else "")
+
     checks = [
         _chk("A1", "§10.1①", f"所属板块当日涨幅排名前 {A['sector_top_n']}",
              sector_rank is not None and sector_rank <= A["sector_top_n"],
-             sector_rank, f"<={A['sector_top_n']}"),
+             (f"样本不足（{int(n_mem)}只）" if thin else sector_rank),
+             f"<={A['sector_top_n']}", note=thin_note),
         _chk("A2", "§10.1①", "板块指数当日涨幅 >1%（板块集体启动，不是个股独舞）",
              sector_chg is not None and sector_chg > A["sector_min_chg_pct"],
              _fmt_pct(sector_chg), ">+1%"),
+        # ---- §10.1.1 板块 3 天验证
+        _chk("S1", "§10.1.1①", "板块3日累计涨幅在 +3%~+10%（刚启动甜区）",
+             s1_ok, _fmt_pct(cum3), "+3%~+10%", note=s1_note),
+        _chk("S2", "§10.1.1②", "板块排名上升、或稳定在前5（对比3个交易日前）",
+             s2_ok, f"今天第{int(sector_rank) if sector_rank else '—'}名 / "
+                    f"3日前第{int(rank3ago) if rank3ago else '—'}名", "上升或稳定前5"),
+        _chk("S3", "§10.1.1③", f"板块内涨停家数 ≥{S['limit_up_min']}",
+             None if limit_up is None else limit_up >= S["limit_up_min"],
+             limit_up, f">={S['limit_up_min']}"),
+        _chk("S4", "§10.1.1④", f"过去{S['top10_window']}天有 ≥{S['top10_days_min']} 天在涨幅前10",
+             None if top10_days is None else top10_days >= S["top10_days_min"],
+             top10_days, f">={S['top10_days_min']}天"),
+        _chk("S5", "§10.1.1广度", "板块内涨跌比 ≥2（真普涨；1~2 只做龙头）",
+             s5_ok, f"{breadth:.2f}" if breadth not in (None, float("inf")) else "∞",
+             ">=2", note=s5_note),
+        _chk("A12", "§10.1.1买前3", f"板块内成交额排名前 {S['buy_amount_rank_max']}（4~8 是跟风股，不买）",
+             None if amt_rank is None else amt_rank <= S["buy_amount_rank_max"],
+             (f"第{int(amt_rank)}/{int(amt_n)}名" if amt_rank and amt_n
+              else (f"第{int(amt_rank)}名" if amt_rank else None)),
+             f"<={S['buy_amount_rank_max']}"),
         _chk("A3", "§10.1②", "量比 >1.5，或近3日成交额放大 >1.5 倍",
              (vol is not None and vol >= A["vol_multiple_min"]) or
              (vol3 is not None and vol3 >= A["vol_ratio_3d_min"]),
@@ -173,8 +240,17 @@ def eval_mode_A(f: dict, cfg=C) -> dict:
         notes.append("板块未集体启动：手册要求「板块集体启动」，单只放量追高风险大")
     if vol is not None and vol < C.VOLUME["multiple_clear"]:
         notes.append("量能未达 1.5 倍，属于脉冲不足")
-    return _result("A", checks, required=["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"],
-                   min_ok=10, stop_loss=m["stop_pct"] if "stop_pct" in m else -3.0,
+    if light_zone:
+        notes.append("板块3日已走一半（+10%~+15%）：按 §10.1.1 只准轻仓，止损收紧到 −2%")
+    stop_a = S["light_stop_pct"] if light_zone else (m["stop_pct"] if "stop_pct" in m else -3.0)
+    req = ["A1", "A2", "S1", "S2", "S3", "S4", "S5", "A12",
+           "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"]
+    soft = set(S.get("soft_checks") or [])
+    req = [r for r in req if r not in soft]
+    if soft:
+        notes.append("S3（涨停家数）/S5（涨跌比）按池内样本只能作强度参考，不阻断（池子只覆盖行业部分成分股）")
+    return _result("A", checks, required=req, min_ok=len(req),
+                   stop_loss=stop_a,
                    take_profit=m.get("take_profit_pct", 8.0),
                    max_hold_days=m.get("max_hold_days_hard", 5),
                    position_cap=m["single_cap"], notes=notes)

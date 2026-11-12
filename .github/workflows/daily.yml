@@ -1,0 +1,78 @@
+name: daily-dashboard
+
+# 云端每天自动生成看板（不依赖你自己的电脑）
+#
+# 北京时间 15:20（周一~周五）跑一次：
+#   1) 拉当天收盘数据（腾讯日线 + 实时行情、东财估值/财务、新浪快照）
+#   2) 用手册规则算 A/B/C 信号，生成看板 + status.json（已脱敏）
+#   3) 推到 gh-pages 分支 → GitHub Pages 自动上线
+#   4) 如果你在仓库 Secrets 里配了 PUSHPLUS_TOKEN，再往微信推一条
+#
+# 注意：GitHub Actions 的 runner 是 UTC 时区，脚本内部已统一按北京时间判断
+# 「今天/是否收盘」，不要依赖 runner 的本地时间。
+on:
+  schedule:
+    - cron: "20 7 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-dashboard
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Shanghai
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build data and dashboard
+        run: |
+          set -euo pipefail
+          python tools/quick_refresh.py
+          python tools/build_static.py
+          echo "--- status.json ---"
+          cat dist/status.json
+
+      - name: Publish to gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          git init -q -b gh-pages
+          git config user.name "stock-dashboard-bot"
+          git config user.email "stock-dashboard-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "auto build $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+
+      - name: WeChat push (optional)
+        continue-on-error: true
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          if [ -n "${PUSHPLUS_TOKEN:-}" ]; then
+            python tools/push_daily.py
+          else
+            echo "没有配置 PUSHPLUS_TOKEN，跳过微信推送。"
+          fi
