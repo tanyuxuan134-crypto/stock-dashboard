@@ -39,6 +39,47 @@ def _key_of(code: str) -> str:
     return ""
 
 
+def _screen_summary(data_dir: str) -> dict:
+    """读 data/screen_market.json（全 A 选股扫描），给页面第 8 节用。
+
+    只保留页面要展示的字段，体积控制在几十 KB；没有文件时返回 {}。
+    """
+    path = os.path.join(data_dir or "", "screen_market.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    def _rows(mode, key="rows"):
+        out = []
+        for r in (doc.get(mode) or {}).get(key) or []:
+            item = {k: r.get(k) for k in (
+                "code", "name", "industry", "price", "chg", "pe", "pb",
+                "mktcap_yi", "from_hi", "sector_rank", "sector_chg", "cum3",
+                "amount_rank", "light_zone", "score", "n_signals", "ma20",
+                "why", "fail", "veto", "note")}
+            out.append(item)
+        return out
+    return {
+        "date": doc.get("date"),
+        "generated": doc.get("generated"),
+        "universe": doc.get("universe"),
+        "with_bars": doc.get("with_bars"),
+        "market": doc.get("market") or {},
+        "notes": doc.get("notes") or [],
+        "A": {"n": (doc.get("A") or {}).get("n", 0), "rows": _rows("A"),
+              "watch": _rows("A", "watch"), "funnel": (doc.get("A") or {}).get("funnel") or {},
+              "checks": (doc.get("A") or {}).get("checks") or []},
+        "B": {"n": (doc.get("B") or {}).get("n", 0), "rows": _rows("B"),
+              "watch": _rows("B", "watch"), "veto": (doc.get("B") or {}).get("veto"),
+              "funnel": (doc.get("B") or {}).get("funnel") or {}},
+        "C": {"n": (doc.get("C") or {}).get("n", 0), "rows": _rows("C"),
+              "funnel": (doc.get("C") or {}).get("funnel") or {}},
+    }
+
+
 def _history(out_dir: str) -> list:
     """扫描 out/ 里已生成的看板日期，倒序返回（用于页面左上角切历史）。"""
     if not out_dir or not os.path.isdir(out_dir):
@@ -156,6 +197,18 @@ h2 .hint{margin-left:auto;font-size:11.5px;color:var(--sub);font-weight:400}
 .pick.B{background:var(--bluebg);color:var(--blue)}
 .pick.C{background:var(--warnbg);color:var(--warn)}
 .pick.none{color:var(--sub);background:transparent;padding-left:0}
+/* 全 A 选股（第 8 节） */
+.scr-item{border-top:1px dashed var(--line);padding:9px 0 6px}
+.scr-item:first-child{border-top:0;padding-top:1px}
+.scr-h{display:flex;align-items:center;gap:7px;font-size:13.5px}
+.scr-h b{font-size:14px}
+.scr-h .c{font-size:11.5px;color:var(--sub);font-variant-numeric:tabular-nums}
+.scr-h .px{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
+.scr-m{font-size:12px;color:var(--sub);margin-top:2px}
+.scr-ok{font-size:12px;color:var(--ok);margin-top:3px;line-height:1.45}
+.scr-no{font-size:12px;color:var(--no);margin-top:3px;line-height:1.45}
+.scr-funnel{font-size:12px;color:var(--sub);line-height:1.6}
+.scr-funnel b{color:var(--fg)}
 .tag{font-size:11px;color:var(--sub);background:var(--nobg);border-radius:6px;padding:1px 6px}
 .filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
 .filters button{font:inherit;font-size:12.5px;border:1px solid var(--line);background:var(--card);color:var(--sub);
@@ -776,10 +829,79 @@ function initUpdateBtn(){
   });
 }
 
+function scrPick(mode, r, extra){
+  const meta = (mode === 'C')
+    ? ('行业 ' + esc(r.industry || '—') + ' · PE ' + num(r.pe) + ' · PB ' + num(r.pb) +
+       ' · 距 90 日高 ' + num(r.from_hi, 1) + '%' + (r.mktcap_yi ? (' · ' + num(r.mktcap_yi, 0) + ' 亿') : '') +
+       (r.chg != null ? (' · 今日 ' + pct(r.chg)) : ''))
+    : ('行业 ' + esc(r.industry || '—') + (r.sector_rank ? (' 第' + r.sector_rank) : '') +
+       (r.chg != null ? (' · 今日 ' + pct(r.chg)) : '') + (r.cum3 != null && mode !== 'C' ? (' · 3日 ' + pct(r.cum3)) : ''));
+  const why = (r.why || []).slice(0, 3).join('；');
+  const fail = (r.fail || []).slice(0, 3).join('；');
+  const tags = [];
+  if (r.light_zone) tags.push('<span class="tag">轻仓 · 止损收紧</span>');
+  if (r.n_signals) tags.push('<span class="tag">' + r.n_signals + '/4 信号</span>');
+  if (r.veto && r.veto.length) tags.push('<span class="tag">被否决</span>');
+  return '<div class="scr-item"><div class="scr-h"><b>' + esc(r.name || '') + '</b>' +
+    '<span class="c">' + esc(r.code || '') + '</span>' + tags.join('') +
+    '<span class="px">' + num(r.price) + '</span></div>' +
+    '<div class="scr-m">' + meta + '</div>' +
+    (why ? ('<div class="scr-ok">✓ ' + esc(why) + '</div>') : '') +
+    (fail ? ('<div class="scr-no">✗ ' + esc(fail) + '</div>') : '') +
+    (r.note ? ('<div class="scr-m">' + esc(r.note) + '</div>') : '') +
+    (r.veto && r.veto.length ? ('<div class="scr-no">否决：' + esc(r.veto.join('；')) + '</div>') : '') +
+    '</div>';
+}
+
+function scrBlock(title, sub, rows, mode, emptyText){
+  let h = '<div style="font-weight:700;font-size:14px;margin:10px 0 4px">' + title +
+    ' <span class="tag">' + sub + '</span></div>';
+  if (!rows || !rows.length) return h + '<div class="empty">' + esc(emptyText || '今天 0 只。') + '</div>';
+  return h + rows.map(r => scrPick(mode, r)).join('');
+}
+
+function screen8(){
+  const box = $('#screenBox');
+  if (!box) return;
+  const S = D.screen || {};
+  if (!S.date){
+    box.innerHTML = '<div class="empty">还没有全 A 选股数据。双击「1-电脑看板.bat」生成一次，或等云端每天 15:20 自动生成。</div>';
+    return;
+  }
+  const mk = S.market || {};
+  const head = '<div class="scr-m" style="margin-bottom:8px">扫描 ' + (S.universe || 0) + ' 只全 A（有 K 线 ' +
+    (S.with_bars || 0) + ' 只）· 数据日 ' + esc(S.date) + ' · 沪深300 ' +
+    (mk.above_ma20 == null ? '—' : (mk.above_ma20 ? '站上 MA20' : '跌破 MA20')) + '</div>';
+  const A = S.A || {}, B = S.B || {}, C = S.C || {};
+  let h = head;
+  h += scrBlock('A 短线（全 A）', 'A 通过 ' + (A.n || 0) + ' 只 · 观察 ' + (A.watch || []).length + ' 只', A.rows, 'A',
+    '今天 0 只。A 要求「行业涨幅前5 + 行业涨>1% + 3日累计+3~10% + 个股量价到位」，今天没有同时满足的。');
+  if ((A.watch || []).length){
+    h += '<div class="scr-m">行业今天确实在前 5、但个股还没到位（点开看差哪几条）：</div>';
+    h += A.watch.map(r => scrPick('A', r)).join('');
+  }
+  if (A.funnel && Object.keys(A.funnel).length){
+    const f = Object.keys(A.funnel).map(k => '<b>' + k + '</b> ' + A.funnel[k] + ' 只未过').join(' · ');
+    h += '<details style="margin-top:8px"><summary>A 的漏斗（为什么只剩这么少）</summary><div class="scr-funnel">' + f + '</div></details>';
+  }
+  h += scrBlock('B 中线波段（全 A）', 'B 通过 ' + (B.n || 0) + ' 只 · 被否决观察 ' + (B.watch || []).length + ' 只', B.rows, 'B',
+    B.veto || '今天没有满足「四信号 ≥2 且①必选」的。');
+  if ((B.watch || []).length){
+    h += '<div class="scr-m">信号数够但被否决（不是买入信号，只是「本来最接近」）：</div>';
+    h += B.watch.map(r => scrPick('B', r)).join('');
+  }
+  h += scrBlock('C 长线（全 A 粗筛）', 'C 粗筛 ' + (C.n || 0) + ' 只', C.rows, 'C',
+    '今天没有 PE≤25 且 PB≤1.5、距 90 日高 ≤−20% 的。');
+  if ((C.rows || []).length){
+    h += '<div class="scr-m">C 是粗筛：PE 5 年分位、股息率、连续盈利、负债率还要逐只补财务后才能定论（池内 154 只会做完整判定）。</div>';
+  }
+  box.innerHTML = h;
+}
+
 function boot(){
   initHist();
   hero(); headline(); signals(); recent(); bindFilters(); renderRows();
-  holdings(); volume(); layers(); risk(); repair(); footer();
+  holdings(); volume(); layers(); risk(); repair(); screen8(); footer();
   applyLive();
   initLive();
   initUpdateBtn();
@@ -827,6 +949,7 @@ TPL = """<!doctype html>
       <a href="#signals" class="on">今日信号</a>
       <a href="#recent">近五日</a>
       <a href="#all">逐票对照</a>
+      <a href="#screen">全A选股</a>
       <a href="#holdings">持仓处置</a>
       <a href="#volume">放量榜</a>
       <a href="#portfolio">仓位风控</a>
@@ -873,6 +996,10 @@ TPL = """<!doctype html>
   <div id="more"></div>
 
   <h2 id="holdings"><span class="no">5</span>我的持仓怎么办<span class="hint">§七 处置方案</span></h2>
+  <div class="card" style="padding:10px 13px">
+    <a href="holdings_edit.html" style="color:var(--blue);font-weight:600;text-decoration:none">✏️ 修改我的持仓（现金 / 股票 / 股数 / 成本 / 买入日期）</a>
+    <div style="font-size:12px;color:var(--sub);margin-top:3px">自己填一次，以后换股只要改这里；不填就一直用 2026-10-15 的旧快照。</div>
+  </div>
   <div id="holdBox"></div>
 
   <h2 id="volume"><span class="no">6</span>放量诊断 Top20<span class="hint">§9.3 真放量四条</span></h2>
@@ -882,6 +1009,9 @@ TPL = """<!doctype html>
   <div id="layerBox"></div>
   <div class="card" id="riskBox"></div>
   <div class="card" id="repairBox"></div>
+
+  <h2 id="screen"><span class="no">8</span>全 A 选股：5000+ 只里筛出来的候选<span class="hint">A/B/C 三模式全市场版</span></h2>
+  <div class="card" id="screenBox"></div>
 
   <details>
     <summary>历史回测速览（这是“规则有没有用”的体检，不是今日信号）</summary>
@@ -957,6 +1087,7 @@ def _payload(ctx: dict, out_dir: str | None = None) -> dict:
         "repair": ctx.get("repair") or {},
         "execution_order": ctx.get("execution_order") or [],
         "account": ctx.get("account") or {},
+        "screen": _screen_summary(os.path.join(os.path.dirname(out_dir or ""), "data")),
         "profile": ctx.get("profile") or "",
         "meta": ctx.get("meta") or {},
     }
@@ -983,4 +1114,188 @@ def write_all(ctx: dict, out_dir: str, date: str) -> dict:
     p_idx = os.path.join(out_dir, "index.html")
     with open(p_idx, "w", encoding="utf-8") as fh:
         fh.write(html)
-    return {"html": p_day, "index": p_idx}
+    editor = write_holdings_editor(out_dir)
+    return {"html": p_day, "index": p_idx, "holdings_editor": editor}
+
+
+# --------------------------------------------------------------------------- #
+# 持仓自助录入页（2026-11-12）
+# --------------------------------------------------------------------------- #
+HOLDINGS_EDITOR_TPL = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>我的持仓 · 录入</title>
+<style>
+:root{--bg:#f5f7fa;--card:#fff;--fg:#1f2937;--sub:#6b7280;--line:#e5e7eb;--blue:#2563eb;--bluebg:#eff6ff;--ok:#16a34a;--no:#dc2626;--nobg:#f3f4f6}
+@media (prefers-color-scheme:dark){:root{--bg:#0f172a;--card:#16213c;--fg:#e5e7eb;--sub:#94a3b8;--line:#243043;--bluebg:#10243d;--nobg:#1b2740}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:14px 14px 60px}
+h1{font-size:19px;margin:6px 0 2px}
+.sub{color:var(--sub);font-size:12.5px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+label{display:block;font-size:12.5px;color:var(--sub);margin:10px 0 4px}
+input{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--fg);font-size:15px}
+.row{margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left}
+th{color:var(--sub);font-weight:500;font-size:12px}
+td input{padding:6px 7px;font-size:14px}
+.btn{display:inline-block;border:0;border-radius:10px;padding:11px 16px;font-size:15px;background:var(--blue);color:#fff;font-weight:600}
+.btn.ghost{background:var(--nobg);color:var(--fg);font-weight:500}
+.btn:disabled{opacity:.5}
+.del{background:transparent;color:var(--no);border:0;font-size:13px}
+.note{font-size:12.5px;color:var(--sub);line-height:1.6}
+.msg{margin-top:10px;font-size:13.5px;white-space:pre-wrap}
+.msg.ok{color:var(--ok)} .msg.no{color:var(--no)}
+.bar{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+@media (max-width:560px){
+  table{display:block}
+  thead{display:none}
+  tbody{display:block}
+  tbody tr{display:block;border:1px solid var(--line);border-radius:12px;padding:10px 10px 4px;margin-bottom:10px}
+  td{display:block;border:0;padding:0;margin-bottom:8px}
+  td::before{content:attr(data-l);display:block;font-size:11.5px;color:var(--sub);margin-bottom:2px}
+  td:last-child{margin:0;padding-bottom:6px}
+  td input{padding:8px 9px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>我的持仓（自己填）</h1>
+  <div class="sub">填一次就好；以后换了股票/加减仓，回到这里改一下再保存，看板会自动重算。数据只存在你自己电脑的 data/holdings_user.json。</div>
+
+  <div class="card">
+    <div style="font-weight:700;margin-bottom:4px">账户</div>
+    <label>可用现金（元）</label>
+    <input id="cash" type="number" step="0.01" placeholder="例如 1684.01">
+    <label>本金（元，用于算总盈亏；不知道可留空）</label>
+    <input id="principal" type="number" step="0.01" placeholder="例如 122400">
+  </div>
+
+  <div class="card">
+    <div style="font-weight:700;margin-bottom:6px">持仓明细</div>
+    <table>
+      <thead><tr><th style="width:30%">代码</th><th>名称</th><th style="width:22%">股数</th><th style="width:24%">成本价</th><th style="width:14%">买入日期</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="bar">
+      <button class="btn ghost" id="add" type="button">+ 加一行</button>
+      <button class="btn" id="save" type="button">保存并重算看板</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card note">
+    <b>怎么填</b><br>
+    · 代码填 6 位数字（如 600183）；名称可留空，会自动查。<br>
+    · 股数、成本价按你券商 App 里的「持仓」页抄。<br>
+    · 买入日期格式 2026-11-01（可不填，但填了以后除权除息会按买入日之后算）。<br>
+    · 保存后会先写文件、再重算一遍看板（约 6~15 秒），然后回到看板页面。<br>
+    <b>打不开/保存没反应？</b> 说明你是直接双击 HTML 打开的。请用「2-手机看板.bat」或「8-填写我的持仓.bat」启动本地服务再点保存。
+  </div>
+</div>
+<script id="seed" type="application/json">__SEED__</script>
+<script>
+const SEED = JSON.parse(document.getElementById('seed').textContent);
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function addRow(h){
+  h = h || {};
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td data-l="代码"><input class="code" inputmode="numeric" maxlength="6" value="' + esc(h.code || '') + '"></td>' +
+    '<td data-l="名称"><input class="name" value="' + esc(h.name || '') + '"></td>' +
+    '<td data-l="股数"><input class="shares" type="number" min="0" step="100" value="' + (h.shares != null ? h.shares : '') + '"></td>' +
+    '<td data-l="成本价"><input class="cost" type="number" min="0" step="0.001" value="' + (h.cost != null ? h.cost : '') + '"></td>' +
+    '<td data-l="买入日期"><input class="buy_date" placeholder="2026-11-01" value="' + esc(h.buy_date || '') + '"></td>' +
+    '<td data-l=""><button class="del" type="button">删除这一行</button></td>';
+  tr.querySelector('.del').addEventListener('click', () => tr.remove());
+  $('#rows').appendChild(tr);
+}
+
+function collect(){
+  const holdings = [];
+  document.querySelectorAll('#rows tr').forEach(tr => {
+    const code = (tr.querySelector('.code').value || '').trim();
+    const name = (tr.querySelector('.name').value || '').trim();
+    const shares = parseFloat(tr.querySelector('.shares').value);
+    const cost = parseFloat(tr.querySelector('.cost').value);
+    const buy_date = (tr.querySelector('.buy_date').value || '').trim();
+    if (!code) return;
+    holdings.push({code, name, shares: isNaN(shares) ? 0 : shares, cost: isNaN(cost) ? null : cost, buy_date});
+  });
+  return {
+    cash: parseFloat($('#cash').value) || 0,
+    principal: parseFloat($('#principal').value) || null,
+    holdings,
+  };
+}
+
+function message(text, ok){
+  const m = $('#msg'); m.textContent = text; m.className = 'msg ' + (ok ? 'ok' : 'no');
+}
+
+async function save(){
+  const body = collect();
+  if (!body.holdings.length){ message('至少填一只持仓（代码 + 股数）', false); return; }
+  const btn = $('#save'); btn.disabled = true; btn.textContent = '保存中…';
+  try{
+    const res = await fetch('/api/holdings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await res.json();
+    if (j.ok){
+      message('已保存 ✅ ' + (j.seconds ? ('看板重算用了 ' + j.seconds + ' 秒，正在跳回看板…') : ''), true);
+      setTimeout(() => { location.href = '/'; }, 900);
+    } else {
+      message('保存失败：' + (j.error || j.message || '未知错误'), false);
+    }
+  }catch(e){
+    message('保存失败：' + e + '\\n（如果是直接双击打开的文件，请用 8-填写我的持仓.bat 启动服务）', false);
+  }finally{
+    btn.disabled = false; btn.textContent = '保存并重算看板';
+  }
+}
+
+$('#add').addEventListener('click', () => addRow({}));
+$('#save').addEventListener('click', save);
+(SEED.holdings || []).forEach(addRow);
+if (!(SEED.holdings || []).length) addRow({});
+$('#cash').value = SEED.cash != null ? SEED.cash : '';
+$('#principal').value = SEED.principal != null ? SEED.principal : '';
+</script>
+</body>
+</html>
+"""
+
+
+def write_holdings_editor(out_dir: str) -> str:
+    """生成 out/holdings_edit.html：手机/电脑上填自己的现金、持仓、成本、买入日期。"""
+    from . import portfolio as PF  # 延迟导入，避免循环引用
+
+    os.makedirs(out_dir, exist_ok=True)
+    user = PF.load_user_holdings()
+    if user:
+        seed = {
+            "cash": user.get("cash"),
+            "principal": user.get("principal"),
+            "holdings": user.get("holdings_clean") or [],
+        }
+    else:
+        acc = PF.load_account()
+        hold = PF.load_holdings()
+        seed = {
+            "cash": acc.get("cash"),
+            "principal": acc.get("principal"),
+            "holdings": [{"code": h["code"], "name": h.get("name"), "shares": h.get("shares"),
+                          "cost": h.get("cost"), "buy_date": h.get("buy_date") or ""}
+                         for h in hold],
+        }
+    payload = json.dumps(seed, ensure_ascii=False, default=str).replace("</", "<\\/")
+    html = HOLDINGS_EDITOR_TPL.replace("__SEED__", payload)
+    path = os.path.join(out_dir, "holdings_edit.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return path

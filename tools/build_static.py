@@ -134,6 +134,37 @@ def _sanitize_html(path: str) -> bool:
     return True
 
 
+def _public_fixes(path: str) -> bool:
+    """公开版专属修补：把本机才有的「修改我的持仓」入口换成说明文字。
+
+    公开站是静态页面，没有 /api/holdings 服务，点进去会是 404；
+    改成提示用户回本机用 8-填写我的持仓.bat。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            html = fh.read()
+    except Exception:
+        return False
+    changed = False
+    link_start = '<a href="holdings_edit.html"'
+    if link_start in html:
+        idx = html.index(link_start)
+        end = html.index("</a>", idx)
+        html = html[:idx] + (
+            '<span style="color:var(--sub);font-weight:600">✏️ 修改我的持仓：'
+            "回你自己电脑上双击「8-填写我的持仓.bat」录入（公开版没有修改入口）</span>"
+        ) + html[end + len("</a>"):]
+        changed = True
+    html = html.replace(
+        "自己填一次，以后换股只要改这里；不填就一直用 2026-10-15 的旧快照。",
+        "公开版只显示脱敏后的持仓（隐藏股数/成本/金额）；你自己的录入只在电脑本地生效。",
+    )
+    if changed:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+    return changed
+
+
 def _fix_history(path: str, dates) -> bool:
     """把页面内嵌 payload 的 history 改成 dist 里实际存在的日期（倒序）。
 
@@ -187,6 +218,7 @@ def build(date: str | None = None, clean: bool = True, public: bool = True) -> d
         for name in ["index.html"] + copied:
             if _sanitize_html(os.path.join(DIST, name)):
                 scrubbed += 1
+            _public_fixes(os.path.join(DIST, name))
 
     # 2.6) 补全日期下拉：history 用 dist 里真实存在的日期（含今天）
     dates = sorted(

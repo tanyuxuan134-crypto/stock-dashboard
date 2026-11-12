@@ -13,6 +13,40 @@ from typing import Any, Optional
 
 from . import config as C
 
+# 用户自己填的持仓（2026-11-12 新增）：网页里录入后写到 data/holdings_user.json。
+# 只要这个文件存在，就完全以它为准（不再用 2026-10-15 工作簿里的旧快照），
+# 这样用户换股/加减仓后不会「一换就全错」。
+USER_HOLDINGS_PATH = os.path.join(C.DATA, "holdings_user.json")
+
+
+def load_user_holdings() -> Optional[dict]:
+    """读 data/holdings_user.json；不存在或格式坏返回 None。"""
+    if not os.path.exists(USER_HOLDINGS_PATH):
+        return None
+    try:
+        with open(USER_HOLDINGS_PATH, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    rows = []
+    for r in doc.get("holdings") or []:
+        code = str(r.get("code") or "").strip().zfill(6)
+        shares = _num(r.get("shares"))
+        if not code.isdigit() or len(code) != 6 or not shares or shares <= 0:
+            continue
+        rows.append({
+            "code": code,
+            "name": str(r.get("name") or "").strip(),
+            "shares": float(shares),
+            "cost": _num(r.get("cost")),
+            "buy_date": str(r.get("buy_date") or ""),
+            "source": "user",
+        })
+    doc["holdings_clean"] = rows
+    return doc
+
 
 def _num(x: Any) -> Optional[float]:
     try:
@@ -26,7 +60,17 @@ def _num(x: Any) -> Optional[float]:
 
 
 def load_account() -> dict:
-    """从 data/pool_source.json 读账户快照（旧工作簿口径），缺省用 config。"""
+    """读账户：优先 data/holdings_user.json（用户自己填的现金/本金），否则旧工作簿快照。"""
+    user = load_user_holdings()
+    if user:
+        acc = dict(C.ACCOUNT)
+        for key in ("cash", "principal", "total_asset"):
+            v = _num(user.get(key))
+            if v is not None:
+                acc[key] = v
+        acc["source"] = "user"
+        acc["asof"] = str(user.get("updated") or "")
+        return acc
     path = os.path.join(C.DATA, "pool_source.json")
     acc = dict(C.ACCOUNT)
     if os.path.exists(path):
@@ -42,39 +86,46 @@ def load_account() -> dict:
 
 
 def load_holdings() -> list[dict]:
-    """读旧工作簿的 5 只持仓；失败则用 config.HOLDINGS。"""
-    path = os.path.join(C.DATA, "pool_source.json")
-    out = []
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            src = json.load(fh)
-        rows = (src.get("sections") or {}).get("holdings") or []
-        seen = set()
-        for r in rows:
-            code = str(r.get("代码") or r.get("code") or "").zfill(6)
-            shares = _num(r.get("holding") or r.get("持股数") or r.get("shares"))
-            if not code or code == "000000" or code in seen or not shares:
-                continue
-            seen.add(code)
-            out.append({
-                "code": code,
-                "name": r.get("名称") or r.get("name") or "",
-                "shares": shares,
-                "cost": _num(r.get("成本") or r.get("cost")) or None,
-                "loss_pct": _num(r.get("盈亏") or r.get("loss_pct")),
-            })
-    if not out:
-        out = [{"code": h["code"], "name": h["name"], "shares": h["shares"], "cost": h["cost"]}
-               for h in C.HOLDINGS]
-    # 合并 §七 的处置意见
+    """读持仓：优先用户自己填的 data/holdings_user.json，否则旧工作簿的 5 只（再否则 config）。"""
+    user = load_user_holdings()
+    if user and user.get("holdings_clean"):
+        out = list(user["holdings_clean"])
+    else:
+        out = []
+        path = os.path.join(C.DATA, "pool_source.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                src = json.load(fh)
+            rows = (src.get("sections") or {}).get("holdings") or []
+            seen = set()
+            for r in rows:
+                code = str(r.get("代码") or r.get("code") or "").zfill(6)
+                shares = _num(r.get("holding") or r.get("持股数") or r.get("shares"))
+                if not code or code == "000000" or code in seen or not shares:
+                    continue
+                seen.add(code)
+                out.append({
+                    "code": code,
+                    "name": r.get("名称") or r.get("name") or "",
+                    "shares": shares,
+                    "cost": _num(r.get("成本") or r.get("cost")) or None,
+                    "loss_pct": _num(r.get("盈亏") or r.get("loss_pct")),
+                })
+        if not out:
+            out = [{"code": h["code"], "name": h["name"], "shares": h["shares"], "cost": h["cost"]}
+                   for h in C.HOLDINGS]
+    # 合并 §七 的处置意见；用户自己填的股票若不在 §七 名单里，按纪律给通用建议
     advice = {h["code"]: h for h in C.HOLDINGS}
     for h in out:
         a = advice.get(h["code"], {})
-        h["action"] = a.get("action", "持有观察")
+        h["action"] = a.get("action") or "持有观察"
         h["reason"] = a.get("reason", "")
         h["trigger"] = a.get("trigger", "")
         h["stop_level"] = a.get("stop_level")
         h["delta_pct"] = a.get("delta_pct", 0.0)
+        if h.get("source") == "user" and not a:
+            h["reason"] = "你自己录入的持仓（手册里没有这只的历史处置意见）"
+            h["trigger"] = "参照 §三 三模式：短线−3%硬止损；波段跌破 MA20 减半"
     return out
 
 

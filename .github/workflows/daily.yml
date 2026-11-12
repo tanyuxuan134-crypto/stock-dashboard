@@ -25,7 +25,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       TZ: Asia/Shanghai
       PYTHONUTF8: "1"
@@ -41,13 +41,33 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # 数据缓存：云端不能每天全量抓（跑一次约 13 分钟以上），
+      # 有缓存时每天只追加「当天这一根」行情（1~2 分钟）。
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/bars
+            data/bars_long
+            data/adj
+            data/val
+            data/fin
+            data/market_bars.json
+            data/market_industry.json
+            data/pool.json
+            data/snapshot.json
+            data/industry_daily.json
+          key: data-${{ github.run_id }}
+          restore-keys: |
+            data-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Build data and dashboard
         run: |
           set -euo pipefail
-          python tools/quick_refresh.py
+          python tools/quick_refresh.py --cloud
           python tools/build_static.py
           echo "--- status.json ---"
           cat dist/status.json

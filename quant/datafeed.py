@@ -498,25 +498,71 @@ def _quote_record(key, fields):
     }
 
 
-def fetch_quotes(keys, batch=QUOTE_BATCH):
+def fetch_quotes(keys, batch=120, workers=8):
     """批量取腾讯实时行情 -> {key: record}。
 
-    行情接口不做磁盘缓存（只 3 个请求，必须实时），失败的分批静默跳过。
+    行情接口不做磁盘缓存（必须实时），失败的分批静默跳过。
+    默认 120 只/请求（URL 长度约 1.1KB，腾讯能接受），并并行发请求：
+    云端（GitHub runner 到腾讯 RTT 约 5~8 秒）靠并行才可能在 1 分钟内抓完 5000+ 只。
     """
     keys = [k for k in dict.fromkeys(keys or []) if k]
-    out = {}
-    for i in range(0, len(keys), max(1, int(batch))):
-        part = keys[i:i + max(1, int(batch))]
+    batch = max(1, int(batch))
+    parts = [keys[i:i + batch] for i in range(0, len(keys), batch)]
+
+    def _one(part):
         url = TX_QUOTE_URL.format(codes=",".join(part))
         try:
-            text = http_get(url, encoding="gb18030", retries=2)
+            return http_get(url, encoding="gb18030", retries=2)
         except DataError:
-            continue
+            return ""
+
+    out = {}
+    texts = []
+    if len(parts) == 1:
+        texts = [_one(parts[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            for text in pool.map(_one, parts):
+                texts.append(text)
+    for text in texts:
         for key, fields in _quote_fields(text).items():
             rec = _quote_record(key, fields)
             if rec and rec.get("date"):
                 out[key] = rec
     return out
+
+
+def refresh_quote_bars(keys, bars_dir=None, log=print):
+    """云端增量：只把「当日收盘行情」追加进已有 data/bars/*.json（完全不抓 K 线）。
+
+    这是 GitHub Actions 每天跑的快路径：稳定状态下 164 只历史 K 线已随仓库/缓存带过去，
+    每天只需要 2~3 个实时行情请求就能把「今天这根」补上，云端一次运行 1~2 分钟。
+    """
+    bars_dir = bars_dir or BARS
+    quotes = fetch_quotes(list(keys or []))
+    added = skipped = missing = 0
+    for key in list(keys or []):
+        path = os.path.join(bars_dir, key + ".json")
+        if not os.path.exists(path):
+            missing += 1
+            continue
+        quote = quotes.get(key)
+        if not quote:
+            skipped += 1
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            skipped += 1
+            continue
+        if merge_quote_bar(doc, quote):
+            _write_json(path, doc)
+            added += 1
+        else:
+            skipped += 1
+    log(f"[quote-bars] 追加 {added} 只 / 跳过 {skipped} / 缺文件 {missing}（行情 {len(quotes)} 条）")
+    return added
 
 
 def _quote_bar(quote):
