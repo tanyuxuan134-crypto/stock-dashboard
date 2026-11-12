@@ -41,6 +41,19 @@ def main(argv=None) -> int:
     if rc not in (0, None):
         print(f"[quick] 数据步骤返回 {rc}，继续用现有缓存生成看板。")
 
+    # 全 A 行业热度（§10.1.1 板块验证的数据源）：首次要全量抓行业+K线，之后只用实时行情补当天
+    market = os.path.join(ROOT, "data", "industry_daily.json")
+    stats = os.path.join(ROOT, "data", "market_bars.json")
+    args = ["--quotes"] if os.path.exists(stats) else []
+    if not os.path.exists(market):
+        print("[quick] 第一次需要建立全 A 行业数据（约 3~6 分钟，之后每天只更新当天）…")
+    try:
+        import subprocess
+        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build_market.py")] + args,
+                       cwd=ROOT, check=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[quick] 全 A 行业数据更新失败（用现有缓存继续）：{exc}")
+
     print("[quick] 重算信号 + 生成看板 …")
     old_argv = sys.argv
     try:

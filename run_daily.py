@@ -91,10 +91,72 @@ def load_snapshot_map() -> dict:
 def build_sector_context(pool: dict, snap_map: dict, stocks_bars: dict) -> tuple[dict, list]:
     """按「行业」等权指数算板块当日涨幅与排名（§10.1 板块排名 / §10.3 板块共振）。
 
-    行业优先用东财 F10 的 EM2016 二级行业（data/industry.json，43 个行业），
-    缺失时依次回退到新浪行业、池子大类——只有真实行业板块才能算
-    §10.1.1「板块内成交额前 3 / 涨停家数 / 涨跌家数」。
+    优先使用全 A 行业热度（data/industry_daily.json，tools/build_market.py 生成）：
+    每个行业 30~100 只成员，涨停家数 / 涨跌家数 / 成交额排名才是手册要的口径。
+    没有该文件时回退到「池内行业」口径（153 只池子里每个行业只有 3~19 只）。
     """
+    mk = F.load_industry_daily()
+    if mk and (mk.get("industries") or {}) and (mk.get("members") or {}):
+        out = _sector_context_market(pool, snap_map, mk)
+        if out:
+            return out
+    return _sector_context_pool(pool, snap_map, stocks_bars)
+
+
+def _sector_context_market(pool: dict, snap_map: dict, mk: dict) -> tuple[dict, list]:
+    """全 A 口径：ctx 直接取 industry_daily.json 里算好的热度指标。"""
+    members_map = mk.get("members") or {}
+    inds = mk.get("industries") or {}
+    ind_map = F.load_industry()
+    groups: dict[str, list[dict]] = {}
+    for s in pool.get("stocks") or []:
+        code = str(s["code"])
+        row = snap_map.get(code) or {}
+        ind = (members_map.get(code)
+               or ((ind_map.get(code) or {}).get("industry2"))
+               or row.get("industry") or s.get("industry")
+               or SECTOR_CN.get(s.get("sector"), "其他"))
+        s["industry_name"] = ind
+        groups.setdefault(ind, []).append(s)
+
+    stats = []
+    for ind, members in groups.items():
+        it = inds.get(ind) or {}
+        n = it.get("n") or 0
+        ctx = {
+            "name": ind,
+            "chg_today": it.get("chg"),
+            "ret5": it.get("ret5"),
+            "above_ma20": it.get("above_ma20"),
+            "rank_today": it.get("rank"),
+            "pe_pct": None,
+            "cum3": it.get("cum3"),
+            "rank_3ago": it.get("rank_3ago"),
+            "limit_up": it.get("limit_up"),
+            "top10_days": it.get("top10_days"),
+            "breadth_ratio": it.get("breadth"),
+            "up": it.get("up"),
+            "down": it.get("down"),
+            "n_members": n,
+            "thin": n < 3,
+            "full": True,  # 全 A 口径（每行业 30~100 只），S3/S5 按硬性条件执行
+        }
+        stats.append({"group": ind, "members": members, "ctx": ctx,
+                      "n_members": n, "bars": [], "market_wide": True})
+    if not stats:
+        return {}, []
+    # 排名靠前的排前面（headline 取前 3 个 → 真正「板块最强」）
+    stats.sort(key=lambda s: (s["ctx"].get("rank_today") is None,
+                              s["ctx"].get("rank_today") or 999))
+    sector_ctx_by_stock = {}
+    for s in stats:
+        for m in s["members"]:
+            sector_ctx_by_stock[m["code"]] = s["ctx"]
+    return sector_ctx_by_stock, stats
+
+
+def _sector_context_pool(pool: dict, snap_map: dict, stocks_bars: dict) -> tuple[dict, list]:
+    """回退口径：池内成员合成等权行业指数（每行业只有 3~19 只，广度偏薄）。"""
     ind_map = F.load_industry()
     groups: dict[str, list[dict]] = {}
     for s in pool.get("stocks") or []:
@@ -240,6 +302,19 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
         if b:
             stocks_bars[s["code"]] = b
 
+    # 账户与持仓：先用当日收盘价把总资产重算（旧工作簿快照会高估仓位），
+    # 这样后面「买入预算/占总资产%」用的是真实分母。
+    account = PF.load_account()
+    holdings = PF.adjust_holdings_for_events(PF.load_holdings(), C.ACCOUNT_ASOF)
+    prices = {}
+    for h in holdings:
+        b = stocks_bars.get(h["code"]) or F.load_bars(h["code"])
+        prices[h["code"]] = _num((b or {}).get("close", [np.nan])[-1]) if b else None
+    account = PF.refresh_account(account, holdings, prices)
+    total_asset = _num(account.get("total_asset")) or (
+        sum((_num(prices.get(h["code"])) or 0) * h["shares"] for h in holdings) +
+        (_num(account.get("cash")) or 0))
+
     sector_ctx_by_stock, sector_stats = build_sector_context(pool, snap_map, stocks_bars)
     val_all = {s["code"]: F.load_val(s["code"]) for s in stocks}
     fin_all = {s["code"]: F.load_fin(s["code"]) for s in stocks}
@@ -258,8 +333,20 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
         feats.append(f)
 
     # §10.1.1：通过板块验证后，只买「板块内成交额排名前3」；4~8 是跟风股，不买
+    # 优先用全 A 行业里的成交额排名（每个行业 30~100 只），缺失时回退池内排名
+    mk = F.load_industry_daily()
+    mk_rank = (mk.get("amount_rank") or {}) if mk else {}
+    mk_inds = (mk.get("industries") or {}) if mk else {}
+    for f in feats:
+        ind = f.get("sector_name") or ""
+        r = (mk_rank.get(ind) or {}).get(f.get("code") or "")
+        if r:
+            f["sector_amount_rank"] = r
+            f["sector_amount_n"] = (mk_inds.get(ind) or {}).get("n")
     by_ind: dict[str, list[dict]] = {}
     for f in feats:
+        if f.get("sector_amount_rank"):
+            continue
         by_ind.setdefault(f.get("sector_name") or "—", []).append(f)
     for arr in by_ind.values():
         arr.sort(key=lambda x: -(x.get("amount") or 0))
@@ -303,7 +390,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
                           "close": f.get("close"), "chg_pct": f.get("chg_pct"),
                           "score_text": f"{rA['n_ok']}/{rA['n_req']}",
                           "why": _why(rA, ["A1", "A2", "S", "A12", "A3", "A4", "A5"]),
-                          "trade_plan": _trade_plan(f, rA, PF.load_account(), "A"),
+                          "trade_plan": _trade_plan(f, rA, account, "A"),
                           "stop_text": "−3% 硬止损",
                           "take_text": "+6~8% 全部卖出",
                           "hold_text": "1~5 交易日"})
@@ -312,7 +399,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
                           "close": f.get("close"), "chg_pct": f.get("chg_pct"),
                           "score_text": f"{rB['n_ok']}/{rB['n_req']}",
                           "why": _why(rB, ["B1", "B2", "B3", "B4"]),
-                          "trade_plan": _trade_plan(f, rB, PF.load_account(), "B"),
+                          "trade_plan": _trade_plan(f, rB, account, "B"),
                           "stop_text": (f"跌破MA20({_num(f.get('ma20')) or 0:.2f})减半 / "
                                         f"破MA60({_num(f.get('ma60')) or 0:.2f})清仓"),
                           "take_text": "+20~30% 减 1/3",
@@ -322,7 +409,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
                           "close": f.get("close"), "chg_pct": f.get("chg_pct"),
                           "score_text": f"{rC['n_ok']}/{rC['n_req']}",
                           "why": _why(rC, ["C1", "C2", "C3", "C4"]),
-                          "trade_plan": _trade_plan(f, rC, PF.load_account(), "C") +
+                          "trade_plan": _trade_plan(f, rC, account, "C") +
                                         "；分 5 批、每批 20%（本次只买第 1 批）",
                           "stop_text": "逻辑止损（季报恶化/逻辑破坏/造假）",
                           "take_text": "PE分位>80%减半 / >90%清仓",
@@ -350,16 +437,6 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
                             "true_volume": vc["true_volume"]})
 
     # ---------------------------------------------------------- 组合层
-    account = PF.load_account()
-    holdings = PF.load_holdings()
-    # 持仓可能不在精选池里（如 600183 生益科技），必须单独按代码加载日线取最新收盘价
-    prices = {}
-    for h in holdings:
-        b = stocks_bars.get(h["code"]) or F.load_bars(h["code"])
-        prices[h["code"]] = _num((b or {}).get("close", [np.nan])[-1]) if b else None
-    total_asset = _num(account.get("total_asset")) or (
-        sum((_num(prices.get(h["code"])) or 0) * h["shares"] for h in holdings) +
-        (_num(account.get("cash")) or 0))
     sector_map = {h["code"]: "tech" for h in holdings}  # 五只均为半导体链（§一）
     port = PF.summarize(holdings, prices, sector_map, total_asset)
     positions = [{"code": r["code"], "name": r["name"], "sector": sector_map.get(r["code"], "other"),
@@ -379,7 +456,7 @@ def run(asof: str | None = None, skip_docx: bool = False) -> dict:
     headline = [
         f"三模式信号：A短线 {len(sig_A)} 只 ／ B波段 {len(sig_B)} 只 ／ C长线 {len(sig_C)} 只；"
         f"另按 §10.6 快照口径有 {len(snap_B)} 只满足「站上MA20+MA60且双双上翘」。",
-        f"板块最强：{top_sec_text}。手册 §10.1 要求在脉冲板块里做短线，不在弱势板块抢反弹。",
+        f"相关行业最强（池内）：{top_sec_text}。手册 §10.1 要求在脉冲板块里做短线，不在弱势板块抢反弹。",
         f"账户结构：总资产 {total_asset:,.0f} 元，现金占比 {risk_rep['cash_pct']:.1f}%（手册下限 15%），"
         f"风控违规 {risk_rep['n_violations']} 条。",
         f"下一步动作：{'先执行 §七 的持仓处置（释放约 ' + format(port['holdings']['cash_release'], ',.0f') + ' 元）' if port['holdings']['cash_release'] else '按 §四 顺序执行'}，"

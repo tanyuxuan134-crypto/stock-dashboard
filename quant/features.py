@@ -135,7 +135,7 @@ FEATURE_KEYS = [
     # 板块 3 天验证（§10.1.1）
     "sector_cum3", "sector_rank_3ago", "sector_limit_up", "sector_top10_days",
     "sector_breadth", "sector_amount_rank", "sector_amount_n",
-    "sector_n_members", "sector_thin",
+    "sector_n_members", "sector_thin", "sector_full",
     # 大盘
     "index_above_ma20", "index_ma20_slope", "index_chg_today",
     # 元信息
@@ -279,6 +279,8 @@ def build_features(bars: dict, *, val: Optional[dict] = None,
         # 行业样本数（池内该行业只有 1~2 只时无法算板块热度，A 短线不适用）
         f["sector_n_members"] = sector_ctx.get("n_members")
         f["sector_thin"] = sector_ctx.get("thin")
+        # 是否全 A 行业口径（全 A 时 S3/S5 广度条件才有统计意义，按硬性条件执行）
+        f["sector_full"] = sector_ctx.get("full")
 
     # ---- 大盘
     if market_ctx:
@@ -470,6 +472,11 @@ def load_industry() -> dict:
     """行业映射 {code: {industry2, industry1, ...}}（东财 F10 EM2016，tools/build_industry.py 生成）。"""
     doc = _load_json(os.path.join(C.DATA, "industry.json")) or {}
     return doc.get("stocks") or {}
+
+
+def load_industry_daily() -> dict:
+    """全 A 行业热度 {date, members, industries, amount_rank}（tools/build_market.py 生成）。"""
+    return _load_json(os.path.join(C.DATA, "industry_daily.json")) or {}
 
 
 # ============================================================ 历史切片（回测/事件研究用）

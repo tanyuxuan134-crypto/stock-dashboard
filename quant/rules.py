@@ -245,7 +245,8 @@ def eval_mode_A(f: dict, cfg=C) -> dict:
     stop_a = S["light_stop_pct"] if light_zone else (m["stop_pct"] if "stop_pct" in m else -3.0)
     req = ["A1", "A2", "S1", "S2", "S3", "S4", "S5", "A12",
            "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"]
-    soft = set(S.get("soft_checks") or [])
+    # 池内口径（每行业 3~19 只）广度条件不可靠 → soft；全 A 口径下按手册硬性执行
+    soft = set() if f.get("sector_full") else set(S.get("soft_checks") or [])
     req = [r for r in req if r not in soft]
     if soft:
         notes.append("S3（涨停家数）/S5（涨跌比）按池内样本只能作强度参考，不阻断（池子只覆盖行业部分成分股）")

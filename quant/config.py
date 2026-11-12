@@ -31,6 +31,12 @@ ACCOUNT = {
     "cash": 1684.01,
     "total_pnl": -38938.61,
 }
+# 账户/持仓快照日期：持仓股数与成本来自旧工作簿这一天。
+# 若这一天之后有买卖或除权除息，程序做两件事：
+#   ① 总资产每天按「现金 + 当日收盘市值」重算（portfolio.refresh_account）
+#   ② 持仓成本价按 data/adj 里的除权除息事件做调整（portfolio.adjust_holdings_for_events）
+# 但「股数变了」这类真实交易信息无法自动得知，需要用户自己改 data/pool_source.json。
+ACCOUNT_ASOF = "2026-10-15"
 
 # 现有五只持仓（§七 + 旧工作簿 ⑤现有持仓处置）
 HOLDINGS = [

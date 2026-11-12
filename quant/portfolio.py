@@ -78,6 +78,78 @@ def load_holdings() -> list[dict]:
     return out
 
 
+def refresh_account(account: dict, holdings: list[dict], prices: dict[str, float]) -> dict:
+    """用最新收盘价重算账户：总资产 = 可用现金 + 持仓市值。
+
+    旧工作簿里的 total_asset 是 2026-10-15 的快照，之后持仓市值变化（如 600183 从
+    94 跌到 75）不会体现在里面，四层占比 / 单只占比 / 风控检查的分母就会失真。
+    这里在拿到当日收盘价后按「现金 + 市值」重算，并把快照值留在 snapshot_total_asset
+    方便对账；任何一只持仓缺价格就保持原值（避免半截数据造成假数字）。
+    """
+    acc = dict(account or {})
+    cash = _num(acc.get("cash")) or 0.0
+    mv, missing = 0.0, []
+    for h in holdings or []:
+        px = _num((prices or {}).get(h.get("code")))
+        if px is None:
+            missing.append(h.get("code"))
+            continue
+        mv += px * (_num(h.get("shares")) or 0.0)
+    if missing or not holdings:
+        acc["live"] = False
+        acc["live_error"] = ("缺少价格：" + ",".join([m for m in missing if m])) if missing else "无持仓"
+        return acc
+    principal = _num(acc.get("principal")) or _num(C.ACCOUNT.get("principal")) or 0.0
+    total = cash + mv
+    acc["snapshot_total_asset"] = _num(acc.get("total_asset"))
+    acc["total_asset"] = round(total, 2)
+    acc["market_value"] = round(mv, 2)
+    acc["cash"] = round(cash, 2)
+    acc["principal"] = round(principal, 2)
+    acc["total_pnl"] = round(total - principal, 2)
+    acc["cash_pct"] = round(cash / total * 100, 2) if total else 0.0
+    acc["position_pct"] = round(mv / total * 100, 2) if total else 0.0
+    acc["live"] = True
+    # 去掉旧工作簿里的中文键（总资产/总盈亏…），避免下游同时看到两套数字
+    for k in [k for k in list(acc) if any("\u4e00" <= ch <= "\u9fff" for ch in str(k))]:
+        acc.pop(k, None)
+    return acc
+
+
+def adjust_holdings_for_events(holdings: list[dict], since: str = None) -> list[dict]:
+    """把持仓的「股数 / 成本价」按快照日之后的除权除息事件做调整。
+
+    例：某只每 10 股派 8 元（dps=0.8/股）+ 10 转 4（bonus=0.4/股），
+    调整后：股数 ×1.4，成本价 =（原成本 − 0.8）÷ 1.4。
+    这样盈亏% 和「减仓一半卖多少股」才不会因为除权而失真。
+    调整依据是 data/adj/{code}.json 的 items（东财/腾讯复权事件），
+    无法处理「用户自己加减仓」，那类需要用户手动改 data/pool_source.json。
+    """
+    since = since or (C.ACCOUNT_ASOF if hasattr(C, "ACCOUNT_ASOF") else "2026-10-15")
+    out = []
+    for h in holdings or []:
+        item = dict(h)
+        adj_path = os.path.join(C.ADJ, f"{h.get('code')}.json")
+        if os.path.exists(adj_path):
+            try:
+                with open(adj_path, "r", encoding="utf-8") as fh:
+                    adj = json.load(fh)
+                events = [it for it in (adj.get("items") or [])
+                          if str(it.get("date") or "") > since]
+            except Exception:  # noqa: BLE001
+                events = []
+            if events and _num(item.get("cost")):
+                dps = sum((_num(it.get("dps")) or 0.0) for it in events)
+                bonus = 1.0
+                for it in events:
+                    bonus *= 1.0 + (_num(it.get("bonus")) or 0.0)
+                item["cost"] = round(max((_num(item["cost"]) - dps) / bonus, 0.001), 4)
+                item["shares"] = round((_num(item.get("shares")) or 0.0) * bonus, 2)
+                item["event_note"] = f"已按 {len(events)} 次除权除息调整（快照 {since} 之后）"
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------- 持仓处置（§七）
 
 
